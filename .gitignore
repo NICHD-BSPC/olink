@@ -1,0 +1,14 @@
+env/
+
+# no generated results
+*.html
+*_cache*
+*_files
+
+# any data files to keep should be placed in a data folder
+/*.tsv
+
+# record-keeping files
+*.DS_Store
+.Rhistory
+
