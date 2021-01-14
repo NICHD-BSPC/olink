@@ -1,0 +1,474 @@
+---
+title: OLink Analysis
+output:
+    html_document:
+        code_folding: hide
+        toc: true
+        toc_float: true
+params:
+    # should be a list of contrast pairs, e.g. list(treat_control=c('treatment', 'control'))
+    contrast_groups:
+    sampletable_name: "data/sample_table_template.tsv"
+    metadatatable_name: "data/metadata.tsv"
+    cutoff: 0.75
+---
+
+
+```{r, include=FALSE}
+
+knitr::opts_chunk$set(message=FALSE, warning=FALSE)
+library(dplyr)
+library(gtools)
+library(purrr)
+library(readr)
+library(plotly)
+library(ggplot2)
+library(heatmaply)
+library(DT)
+library(tibble)
+library(rlang)
+library(readxl)
+library(tidyxl)
+```
+
+```{r create_tables, cache=TRUE}
+sample_table <- read.table(params$sampletable_name, sep='\t', header=TRUE, stringsAsFactors=FALSE)
+panel_list <- c()
+for (i in 1:nrow(sample_table)){
+    file <- sample_table[i,1] # file and sheet name from sample table
+    sh <- sample_table[i,2] # sheet containing data
+    name <- sample_table[i,3] # name of output
+    prefix <- sample_table[i,4] # prefix of samples names
+    prefix <- as.list(strsplit(prefix, ",")[[1]]) # make list of the prefixes
+    cells <- xlsx_cells(file, sheet = sh)
+    formats <- xlsx_formats(file)
+    # The list of lists of lists of vectors that contain the colors
+    colors <- formats$local$fill$patternFill$fgColor$rgb
+
+    color_cells <- mutate(cells, colors = colors[local_format_id]) %>%
+         filter(colors == 'FFF5AA9C') # tibble with only the cells that are red fill
+    data  <- read_excel(file, sheet = sh, col_name = FALSE) # tibble of data in excel sheet
+    data_NA <- cbind(data)
+
+    for (i in 1:nrow(color_cells)){
+        r <- pull(color_cells[i,3])
+        c <- pull(color_cells[i,4])
+        data_NA[r,c] <- NA
+    }
+    assay <- filter(data, data[1] == 'Assay')
+    assay_NA <- duplicate(assay, shallow = FALSE) # make separate object for NA version
+    undesireables <- c('QC Warning', 'Plate ID', 'batch', 'project')
+
+    for (i in 1:length(prefix)){ #accounts for several prefixes
+        add <- filter(data, startsWith(pull(data[1]),toString(prefix[i])))
+        assay <- rbind(assay,add)
+    }
+    data_final <- as_tibble(t(assay)) %>%
+        filter(!(V1 %in% undesireables))
+    data_final[1,1] <- ''
+    name_all <- paste(name,'.tsv',sep="")
+    panel_list <- c(panel_list, name)
+    write.table(data_final,name_all, sep="\t",row.names=FALSE, col.names=FALSE)
+
+    for (i in 1:length(prefix)) {
+        add_NA <- filter(data_NA, startsWith(pull(data_NA[1]),toString(prefix[i])))
+        assay_NA <- rbind(assay_NA,add_NA)
+    }
+
+    data_final_NA <- as_tibble(t(assay_NA)) %>%
+        filter(!(V1 %in% undesireables))
+    data_final_NA[1,1] <- ''
+    name_all_na <- paste(name,'_color.tsv',sep="")
+    write.table(data_final_NA,name_all_na, sep="\t",row.names=FALSE, col.names=FALSE)
+}
+```
+
+```{r load_panel}
+load.panel <- function(panel){
+    df.val <- read_tsv(paste0(panel, '.tsv')) %>%
+        rename(protein=X1) %>%
+        mutate(panel=panel)
+
+    # filtering proteins and/or samples
+    df.na <- read_tsv(paste0(panel, '_color.tsv')) %>%
+        rename(protein=X1) %>%
+        mutate(panel=panel)
+
+    protein.panel <- df.val %>% select(protein, panel)
+    df.val.samples <- df.val %>% select(-protein, -panel)
+    df.na.samples <- df.na %>% select(-protein, -panel)
+
+    # Only keep a protein if at least params$cutoff of the values are valid (conversely,
+    # keep if under params$cutoff are NA)
+    protein.keep <- df.na.samples  %>% apply(1, function(x) sum(is.na(x))/length(x)) < params$cutoff
+    sample.keep <- df.na.samples %>% apply(2, function(x) sum(is.na(x))/length(x)) < params$cutoff
+
+    df.val.samples[!protein.keep,] <- NA
+    df.val.samples[,!sample.keep] <- NA
+
+    df.val.samples <- bind_cols(protein.panel, df.val.samples)
+
+    all.na.samples <- df.val.samples %>% is.na %>% apply(2, all)
+    all.na.proteins <- df.val.samples %>% is.na %>% apply(1, all)
+    df.val.samples <- df.val.samples[!all.na.proteins, !all.na.samples]
+
+    return(df.val.samples)
+}
+
+# Required for proper headings when using programmatic chunk creation
+mdcat <- function(...){
+    cat('\n\n', ..., '\n\n', sep='', fill=1500)
+}
+```
+
+# Data filtering and handling of low values
+
+The NPX data as provided have low values encoded as red cells in the Excel files. We
+are tracking these as "low values". If, across a panel,
+a protein has>= `r params$cutoff * 100`%
+of values encoded as "low value", that entire protein is set to NA to indicate it
+should not be considered. Similarly, if a sample
+has >= `r params$cutoff * 100`% of values encoded
+as "low value" that entire sample's values for all proteins are reset to NA.
+
+Otherwise, low values are retained as-is. For example a sample with 50% of
+values listed as "low value" will have all of the values retained as-is with
+the low values staying as they are.
+
+For the PCA plots, samples with *any* NAs and proteins with *any* NAs are
+removed because the linear algebra behind PCA does not support missing values.
+
+For the Kruskal-Wallis tests, which are done per protein, any samples with an
+NA for that protein are excluded from the test for that protein.
+
+Proteins that are found in multiple panels are given the suffix -1, -2, or -3
+according to their order of appearance in the input file.
+MyProt-3 does not mean MyProt occurs 3 times, but rather that it first appears
+in a previous panel, and that this is the fourth panel.
+The suffix is arbitrarily chosen based on the order of panels
+in the list.
+
+
+```{r}
+# List loader function
+dfs <- list()
+for (name in panel_list){
+    dfs[[name]] <- load.panel(name)
+}
+```
+
+```{r other_function}
+# Renames proteins encountered in multiple panels, so all will be unique
+find_duplicates <- function(df1, df2, suffix){
+    idx <- df1$protein %in% df2$protein
+
+    my_names <- df1$protein
+
+    if(length(my_names[idx]) >= 1){
+        my_names[idx] <- paste0(my_names[idx], suffix)
+        df1$protein <- my_names
+    }
+    return(df1)
+}
+list_len <- length(dfs)
+for (i in 1:(list_len - 1)){
+    for (j in 1:(list_len - i)){
+        dfs[[i]] <- find_duplicates(dfs[[i]], dfs[[i+j]], toString(-1))
+    }
+}
+
+df <- bind_rows(dfs)
+
+meta <- read_tsv(params$metadatatable_name) %>%
+    rename(sample=sample)
+```
+
+
+# Sample PCA
+
+```{r}
+
+# each row in input df is a sample.
+any.na <- rowSums(is.na(df))>1
+df.no.na <- df[!any.na,]
+pca.df <- df.no.na %>% select(-protein, -panel)
+
+pca <- prcomp(t(pca.df), scale.=TRUE)
+
+# Need to attach metadata to x so that we can color by metadata columns, e.g.
+# disease state. Each row is a sample
+x <- as.data.frame(pca$x)
+x$condition <- meta$group
+
+p <- ggplot(x) +
+    aes(x=PC1, y=PC2, text=rownames(x), color=condition) +
+    geom_point()
+(ggplotly(p))
+
+```
+
+# Protein PCA
+
+These PCAs allow us to examine whether there are any remaining clear outliers
+that would be worth removing from the analysis after removing NAs.
+
+```{r}
+
+# each row in input df is a protein.
+any.na <- rowSums(is.na(df))>1
+df.no.na <- df[!any.na,]
+pca.df <- df.no.na %>% select(-protein, -panel)
+pca <- prcomp(pca.df, scale.=TRUE)
+x <- as.data.frame(pca$x) # each row is a protein
+x$protein <- df.no.na$protein
+x$panel <- df.no.na$panel
+
+p <- ggplot(x) +
+    aes(x=PC1, y=PC2, text=protein, color=panel) +
+    geom_point()
+print(p)
+
+```
+
+# Comparison to other papers' analyses of OLink data
+
+Briefly, we review the methods of other papers presenting OLink data, in order
+of sophistication.
+
+Pulliam et al 2019 (https://doi.org/10.1007/s13365-018-0695-4) make conclusions based on
+plotted heatmaps.
+
+Dencker et al 2017 (http://dx.doi.org/10.1002/brb3.747) use a Wilcoxon
+rank-sum test and a p-value threshold of 0.001. Wilcoxon is only for
+2 conditions; here we're using Kruskal-Wallis that generalizes to comparing
+more than 2 conditions. They lower the p-value threshold to 0.001 to compensate for
+multiple tests.
+
+Backryd et al 2017 (http://dx.doi.org/10.2147/JPR.S128508) do orthogonal
+partial least squares discriminant analysis which, essentially, considers all
+proteins together to identify those that discriminate the two groups best. By
+considering the data together in a multivariate fashion, this may give them
+more power (or at least pick up more subtle details) compared to testing each
+protein individually. This algorithm is implemented in the SIMCA-P commercial
+software.
+
+# Overview of this analysis
+
+We use the Kruskal-Wallis rank-sum test which is a non-parametric version of an
+ANOVA that does not require normally distributed data. For two conditions, this
+is the same as the Wilcoxon test performed by Dencker et al, but has the
+advantage of being able to compare more than 2 conditions if we need to do so
+in the future.
+
+Here, we:
+
+- perform principal components analysis on samples and proteins to look for
+  possible outliers.
+- perform a Kruskal-Wallis rank-sum test for each of the `r nrow(df.no.na)`
+  proteins
+- perform a Benjamini-Hochberg multiple-testing correction to get adjusted
+  p-values (which are equivalent to false discovery rate, or FDR). This is less
+  harsh of a correction than the Boneforroni-like adjustment used by Dencker et
+  al, leading to more proteins being called as differentially abundant.
+
+```{r}
+
+`%not_in%` <- compose(`!`, `%in%`)
+kw <- function(df, group1='GROUP1', group2='GROUP2', column_drop=c()){
+
+    g1_samples <- meta %>% dplyr::filter(group == group1) %>%
+                                filter(sample %not_in% column_drop) %>%
+                                select(sample)
+    g1_vals <- df %>% select(unlist(g1_samples))
+
+    g2_samples <- meta %>% dplyr::filter(group == group2) %>%
+                                filter(sample %not_in% column_drop) %>%
+                                select(sample)
+    g2_vals <- df %>% select(unlist(g2_samples))
+
+    # if only 2 in one group, we want to to avoid performing the test
+    if(sum(!is.na(g1_vals)) <= 2){
+        return(NA)
+    } else if (sum(!is.na(g2_vals)) <= 2){
+        return(NA)
+    }
+
+    vec = c()
+    for (i in 1:nrow(df)){
+        # the trick is that this is by row.
+        # NOTE: Be very careful with as.numeric because it will coerce even
+        # 'NA' to, say, the ASCII value.
+        vec <- c(vec,  kruskal.test(list(as.numeric(g1_vals[i,]), as.numeric(g2_vals[i,])))$p.value)
+    }
+
+    # returns a vector of pvals
+    names(vec) <- df$protein
+    return(vec)
+}
+dfs_comb <- bind_rows(dfs)
+
+any.na <- rowSums(is.na(dfs_comb))>1
+dfs.no.na <- dfs_comb[!any.na,]
+kw.dfs <- dfs.no.na
+
+kw_adjust <- function(df1, group1, group2){
+    kw_vec <-  kw(df1, group1, group2)
+    comb_vec <- p.adjust(kw_vec, method='BH')
+    return(comb_vec)
+ }
+
+kw_contrasts <- list()
+for (name in names(params$contrast_groups)){
+    contrast <- params$contrast_groups[[name]]
+    kw_contrasts[[name]] <- kw_adjust(kw.dfs, contrast[1], contrast[2])
+}
+
+```
+
+
+The following table shows the data before the K-W tests. The data can be sorted
+and filtered using the controls along the tops of the columns.
+
+
+```{r}
+kw_df <- kw.dfs
+
+datatable(kw_df, filter = 'top')
+write.table(kw_df, file='cleaned_output.tsv', sep='\t',
+            row.names=FALSE, quote=FALSE)
+
+```
+
+The cleaned data can be downloaded as a tsv [here](cleaned_output.tsv)
+
+The adjusted p-values, proteins, and panels can be found in the following table:
+
+```{r}
+tbl.df <- data.frame(
+    protein=kw_df$protein,
+    panel=kw_df$panel,
+    kw_contrasts)
+datatable(tbl.df, filter='top')
+write.table(kw_df, file='adjusted_pvals.tsv', sep='\t',
+            row.names=FALSE, quote=FALSE)
+```
+
+This table can be downloaded as a tsv [here](adjusted_pvals.tsv).
+
+## Heatmaps {.tabset}
+
+The following heatmaps visualize the data for the proteins called as
+differentially abundant at padj < 0.1 from the Kruskal-Wallis rank-sum test
+after Benjamini-Hochberg multiple-testing correction. These heatmaps are
+provided in three flavors: unscaled, the 0-1 scaled where the data have been
+normalized to range from 0 to 1, and standardized, where row - row_mean
+/ standard_dev(row). White points indicate missing data. The rationale for
+including multiple scaling versions is to visually highlight different aspects
+of the data.
+
+Note that the colors just under the dendrograms show sample (column) or
+protein (row) metadata, including a visual reminder on the direction of the
+results of the comparison (up or down).
+
+```{r, results='asis', fig.height=7, fig.width=10.5}
+# Custom_scale allows different scaling algorithms to be inserted and
+# applied after the data have been selected.
+plot.heatmap <- function(df, group1, group2, padj, custom_scale=FALSE, ...){
+
+    g1_samples <- meta %>%
+        dplyr::filter(group == group1) %>%
+        select(sample) %>%
+        unlist %>%
+        as.character
+    g2_samples <- meta %>%
+        dplyr::filter(group == group2) %>%
+        select(sample) %>%
+        unlist %>%
+        as.character
+    res <- df %>%
+        select(!!!g1_samples, !!!g2_samples) %>%
+        filter(padj < 0.1) %>%
+        as.data.frame
+
+    # if too few p values are significant return text
+    if (nrow(res) < 2){
+        return(mdcat('Too few (<2) significant values'))
+    }
+
+     # create a norm 0 to 1 scale
+    if(custom_scale){
+        for (i in 1:nrow(res)){
+            row <- res[i,]
+            res[i, ] <- (row - min(row, na.rm=TRUE)) /
+                (max(row, na.rm=TRUE) - min(row, na.rm=TRUE))
+        }
+    }
+    rownames(res) <- (df %>% filter(padj < 0.1))$protein
+    m1 <- apply(res[, g1_samples], 1, median, na.rm=TRUE)
+    m2 <- apply(res[, g2_samples], 1, median, na.rm=TRUE)
+    up <- m1 > m2
+    direction <- up
+    direction[up] <- 'up'
+    direction[!up] <- 'down'
+
+    p <- heatmaply(
+        res,
+        col_side_colors=data.frame(
+                condition=c(
+                            rep(group1, length(g1_samples)),
+                            rep(group2, length(g2_samples))
+                    )
+                ),
+        row_side_colors=data.frame(
+                panel=(df %>% filter(padj < 0.1))$panel,
+                direction=direction
+                ),
+        ...
+    )
+    return(p)
+}
+
+# this function is necesary for the heatmaps to appear
+# after being generated in a for loop. It creates a
+# separate chunk for knitr to parse.
+subchunkify <- function(g, contrast) {
+  g_deparsed <- paste0(deparse(
+    function() {g}
+  ), collapse = '')
+
+# Outside the created chunk we make a heading for the html.
+# TODO: Refactor outside
+knitr::asis_output(cat('<h4>', contrast[1], " vs ", contrast[2], '</h4>'))
+
+sub_chunk <- paste0("
+  `","``{r sub_chunk_", floor(runif(1) * 10000), ", fig.height=10, fig.width=10.5, echo=FALSE}",
+  "\n\n(",
+    g_deparsed
+    , ")()",
+  "\n\n`","``
+  ")
+
+  cat(knitr::knit(text = knitr::knit_expand(text = sub_chunk), quiet = TRUE))
+}
+
+mdcat("### No Scaling {.tabset}")
+for (con_name in names(params$contrast_groups)){
+    contrast <- params$contrast_groups[[con_name]]
+    subchunkify(plot.heatmap(kw_df, group1=contrast[1], group2=contrast[2],
+        padj=kw_contrasts[[con_name]], scale='none'), contrast)
+}
+
+mdcat("### 0-1 Scaling {.tabset}")
+for (con_name in names(params$contrast_groups)){
+    contrast <- params$contrast_groups[[con_name]]
+    subchunkify(plot.heatmap(kw_df, group1=contrast[1], group2=contrast[2],
+        padj=unlist(kw_contrasts[[con_name]]), custom_scale=TRUE,  scale='none'), contrast)
+}
+
+mdcat("### Row Standardizing {.tabset}")
+for (con_name in names(params$contrast_groups)){
+    contrast <- params$contrast_groups[[con_name]]
+    subchunkify(plot.heatmap(kw_df, group1=contrast[1], group2=contrast[2],
+        padj=unlist(kw_contrasts[[con_name]]), scale='row'), contrast)
+}
+```
