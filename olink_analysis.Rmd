@@ -279,12 +279,12 @@ kw <- function(df, group1='GROUP1', group2='GROUP2', column_drop=c()){
     g1_samples <- meta %>% dplyr::filter(group == group1) %>%
                                 filter(sample %not_in% column_drop) %>%
                                 select(sample)
-    g1_vals <- df %>% select(unlist(g1_samples))
+    g1_vals <- df %>% select(unlist(g1_samples, use.names=FALSE))
 
     g2_samples <- meta %>% dplyr::filter(group == group2) %>%
                                 filter(sample %not_in% column_drop) %>%
                                 select(sample)
-    g2_vals <- df %>% select(unlist(g2_samples))
+    g2_vals <- df %>% select(unlist(g2_samples, use.names=FALSE))
 
     # if only 2 in one group, we want to to avoid performing the test
     if(sum(!is.na(g1_vals)) <= 2){
@@ -378,13 +378,11 @@ plot.heatmap <- function(df, group1, group2, padj, custom_scale=FALSE, ...){
     g1_samples <- meta %>%
         dplyr::filter(group == group1) %>%
         select(sample) %>%
-        unlist %>%
-        as.character
+        unlist(use.names = FALSE)
     g2_samples <- meta %>%
         dplyr::filter(group == group2) %>%
         select(sample) %>%
-        unlist %>%
-        as.character
+        unlist(use.names = FALSE)
     res <- df %>%
         select(!!!g1_samples, !!!g2_samples) %>%
         filter(padj < 0.1) %>%
