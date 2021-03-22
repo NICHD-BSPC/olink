@@ -1,6 +1,6 @@
 # contact: nicholas.larue.johnson@gmail.com
 
-#Overview of this analysis
+# Overview of this analysis
 We use the Kruskal-Wallis rank-sum test which is a non-parametric version of an ANOVA that does not require normally distributed data. For two conditions, this is the same as the Wilcoxon test performed by Dencker et al, but has the advantage of being able to compare more than 2 conditions if we need to do so in the future.
 
 Here, we:
